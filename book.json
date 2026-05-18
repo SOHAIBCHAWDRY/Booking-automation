@@ -1,0 +1,308 @@
+{
+  "name": "WhatsApp Appointment Booking AI Chatbot",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-webhook",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-001",
+      "name": "WhatsApp Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 400],
+      "webhookId": "whatsapp-incoming-messages",
+      "notes": "WhatsApp Business API sends all incoming messages to this webhook URL"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse incoming WhatsApp message from Meta Cloud API\nconst body = $input.first().json.body || $input.first().json;\n\nconst entry = body?.entry?.[0];\nconst change = entry?.changes?.[0];\nconst value = change?.value;\n\n// Handle verification challenge\nif ($input.first().json.query?.['hub.challenge']) {\n  return [{ json: { type: 'verification', challenge: $input.first().json.query['hub.challenge'] } }];\n}\n\nconst message = value?.messages?.[0];\nconst contact = value?.contacts?.[0];\n\nif (!message) {\n  return [{ json: { type: 'no_message' } }];\n}\n\nreturn [{\n  json: {\n    type: 'message',\n    phone: message.from,\n    name: contact?.profile?.name || 'User',\n    message_id: message.id,\n    text: message?.text?.body || message?.interactive?.button_reply?.title || '',\n    message_type: message.type,\n    timestamp: message.timestamp,\n    phone_number_id: value?.metadata?.phone_number_id\n  }\n}];"
+      },
+      "id": "node-002",
+      "name": "Parse WhatsApp Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false },
+          "conditions": [
+            {
+              "id": "check-type",
+              "leftValue": "={{ $json.type }}",
+              "rightValue": "message",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ]
+        }
+      },
+      "id": "node-003",
+      "name": "Is Valid Message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 400]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "={{ 'conversation_' + $json.phone }}",
+        "options": {}
+      },
+      "id": "node-004",
+      "name": "Load Conversation History",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [900, 300],
+      "notes": "Loads previous conversation context from Redis for multi-turn memory"
+    },
+    {
+      "parameters": {
+        "jsCode": "const phone = $('Parse WhatsApp Message').first().json.phone;\nconst name = $('Parse WhatsApp Message').first().json.name;\nconst userMessage = $('Parse WhatsApp Message').first().json.text;\nconst rawHistory = $input.first().json.value;\n\nlet history = [];\ntry {\n  history = JSON.parse(rawHistory || '[]');\n} catch(e) {\n  history = [];\n}\n\n// Add new user message\nhistory.push({ role: 'user', content: userMessage });\n\n// Keep last 10 messages only\nif (history.length > 10) history = history.slice(-10);\n\nreturn [{\n  json: {\n    phone,\n    name,\n    userMessage,\n    history,\n    historyJson: JSON.stringify(history)\n  }\n}];"
+      },
+      "id": "node-005",
+      "name": "Build Conversation Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "model": "claude-sonnet-4-20250514",
+        "messages": {
+          "values": [
+            {
+              "role": "user",
+              "content": "={{ $json.historyJson }}"
+            }
+          ]
+        },
+        "options": {
+          "systemMessage": "You are an intelligent appointment booking assistant for a professional services business. Your name is Aria.\n\nYour job is to:\n1. Greet users warmly and understand what service they need\n2. Collect: full name, preferred date, preferred time, service type, and contact email\n3. Check available slots (assume Mon-Fri 9AM-5PM, 1-hour slots)\n4. Confirm the appointment details before booking\n5. Once confirmed, respond with: BOOK_APPOINTMENT:{\"name\":\"...\",\"date\":\"...\",\"time\":\"...\",\"service\":\"...\",\"email\":\"...\",\"phone\":\"...\"}\n\nAvailable services:\n- Consultation (free, 30 min)\n- Strategy Session ($150, 60 min)\n- Full Audit ($300, 90 min)\n\nBe conversational, friendly, and concise. Ask one question at a time. If the user wants to cancel or reschedule, collect their booking reference number.\n\nIMPORTANT: When you have all info and user confirms, output BOOK_APPOINTMENT JSON on its own line."
+        }
+      },
+      "id": "node-006",
+      "name": "Claude AI — Booking Agent",
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [1340, 300],
+      "notes": "Uses Claude Sonnet as the conversational booking agent"
+    },
+    {
+      "parameters": {
+        "jsCode": "const aiResponse = $input.first().json.content?.[0]?.text || $input.first().json.text || '';\nconst phone = $('Build Conversation Context').first().json.phone;\nconst history = $('Build Conversation Context').first().json.history;\n\n// Check if AI wants to book an appointment\nconst bookMatch = aiResponse.match(/BOOK_APPOINTMENT:(\\{[^}]+\\})/s);\nconst shouldBook = !!bookMatch;\nlet bookingData = null;\nif (bookMatch) {\n  try { bookingData = JSON.parse(bookMatch[1]); } catch(e) {}\n}\n\n// Clean response (remove the BOOK_APPOINTMENT line from user-facing message)\nconst cleanResponse = aiResponse.replace(/BOOK_APPOINTMENT:\\{[^}]+\\}/s, '').trim();\n\n// Update history with assistant reply\nhistory.push({ role: 'assistant', content: cleanResponse || aiResponse });\n\nreturn [{\n  json: {\n    phone,\n    response: cleanResponse || aiResponse,\n    fullHistory: JSON.stringify(history),\n    shouldBook,\n    bookingData,\n    phone_number_id: $('Parse WhatsApp Message').first().json.phone_number_id\n  }\n}];"
+      },
+      "id": "node-007",
+      "name": "Parse AI Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{ 'conversation_' + $json.phone }}",
+        "value": "={{ $json.fullHistory }}",
+        "keyType": "string",
+        "expire": true,
+        "ttl": 86400,
+        "options": {}
+      },
+      "id": "node-008",
+      "name": "Save Conversation to Redis",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1780, 200],
+      "notes": "Saves conversation with 24-hour TTL"
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.facebook.com/v18.0/{{ $json.phone_number_id }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_WHATSAPP_ACCESS_TOKEN"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "messaging_product",
+              "value": "whatsapp"
+            },
+            {
+              "name": "to",
+              "value": "={{ $json.phone }}"
+            },
+            {
+              "name": "type",
+              "value": "text"
+            },
+            {
+              "name": "text",
+              "value": "={ \"body\": \"{{ $json.response }}\" }"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-009",
+      "name": "Send WhatsApp Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1780, 380],
+      "notes": "Replace YOUR_WHATSAPP_ACCESS_TOKEN with Meta Cloud API token"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue": "={{ $json.shouldBook }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ]
+        }
+      },
+      "id": "node-010",
+      "name": "Should Book Appointment?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2000, 300]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "calendar": {
+          "value": "YOUR_GOOGLE_CALENDAR_ID",
+          "__rl": true,
+          "mode": "id"
+        },
+        "start": "={{ $json.bookingData.date + 'T' + $json.bookingData.time + ':00' }}",
+        "end": "={{ $json.bookingData.date + 'T' + ($json.bookingData.time.split(':')[0] * 1 + 1) + ':00:00' }}",
+        "additionalFields": {
+          "summary": "={{ 'Appointment: ' + $json.bookingData.service + ' — ' + $json.bookingData.name }}",
+          "description": "={{ 'Client: ' + $json.bookingData.name + '\\nPhone: ' + $json.bookingData.phone + '\\nEmail: ' + $json.bookingData.email + '\\nService: ' + $json.bookingData.service }}",
+          "attendees": "={{ [{ email: $json.bookingData.email }] }}"
+        }
+      },
+      "id": "node-011",
+      "name": "Create Google Calendar Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.1,
+      "position": [2220, 200],
+      "notes": "Replace YOUR_GOOGLE_CALENDAR_ID with your calendar ID"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "__rl": true,
+          "mode": "id"
+        },
+        "sheetName": {
+          "value": "Appointments",
+          "__rl": true,
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "mappingValues": [
+              { "mappingMode": "mapManually", "fieldName": "Name", "value": "={{ $json.bookingData.name }}" },
+              { "mappingMode": "mapManually", "fieldName": "Phone", "value": "={{ $json.bookingData.phone }}" },
+              { "mappingMode": "mapManually", "fieldName": "Email", "value": "={{ $json.bookingData.email }}" },
+              { "mappingMode": "mapManually", "fieldName": "Service", "value": "={{ $json.bookingData.service }}" },
+              { "mappingMode": "mapManually", "fieldName": "Date", "value": "={{ $json.bookingData.date }}" },
+              { "mappingMode": "mapManually", "fieldName": "Time", "value": "={{ $json.bookingData.time }}" },
+              { "mappingMode": "mapManually", "fieldName": "Booked At", "value": "={{ new Date().toISOString() }}" }
+            ]
+          }
+        },
+        "options": {}
+      },
+      "id": "node-012",
+      "name": "Log Appointment to Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.3,
+      "position": [2220, 380]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"ok\" }"
+      },
+      "id": "node-013",
+      "name": "Respond to WhatsApp",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [460, 580]
+    }
+  ],
+  "connections": {
+    "WhatsApp Webhook": {
+      "main": [[{ "node": "Parse WhatsApp Message", "type": "main", "index": 0 }]]
+    },
+    "Parse WhatsApp Message": {
+      "main": [
+        [
+          { "node": "Is Valid Message?", "type": "main", "index": 0 },
+          { "node": "Respond to WhatsApp", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Is Valid Message?": {
+      "main": [[{ "node": "Load Conversation History", "type": "main", "index": 0 }]]
+    },
+    "Load Conversation History": {
+      "main": [[{ "node": "Build Conversation Context", "type": "main", "index": 0 }]]
+    },
+    "Build Conversation Context": {
+      "main": [[{ "node": "Claude AI — Booking Agent", "type": "main", "index": 0 }]]
+    },
+    "Claude AI — Booking Agent": {
+      "main": [[{ "node": "Parse AI Response", "type": "main", "index": 0 }]]
+    },
+    "Parse AI Response": {
+      "main": [
+        [
+          { "node": "Save Conversation to Redis", "type": "main", "index": 0 },
+          { "node": "Send WhatsApp Reply", "type": "main", "index": 0 },
+          { "node": "Should Book Appointment?", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Should Book Appointment?": {
+      "main": [
+        [
+          { "node": "Create Google Calendar Event", "type": "main", "index": 0 },
+          { "node": "Log Appointment to Sheets", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": ["whatsapp", "chatbot", "appointment-booking", "ai-agent"],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "n8nVersion": "1.0.0"
+  }
+}
