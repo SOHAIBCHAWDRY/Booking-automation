@@ -132,12 +132,6 @@ YOUR_GOOGLE_SHEET_ID         → Sheet ID from the URL
 
 ---
 
-## 📸 Workflow Preview
-
-> Import the JSON into n8n and take a screenshot of your canvas here.
-
----
-
 ## 🔧 Customization Tips
 
 - **Change services/pricing**: Edit the system prompt in the Claude AI node
