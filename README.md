@@ -149,10 +149,4 @@ YOUR_GOOGLE_SHEET_ID         → Sheet ID from the URL
 
 ---
 
-## ⚠️ Security Note
-
-This workflow JSON has been scrubbed of all API tokens and credentials. Never commit real tokens to GitHub. Use n8n's credentials manager and environment variables for all secrets.
-
----
-
 **Built with:** n8n • WhatsApp Business API • Claude Sonnet • Redis • Google Calendar • Google Sheets
